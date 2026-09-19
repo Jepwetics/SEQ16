@@ -69,7 +69,7 @@ module tt_um_jet_seq16 (
   // in your whole program back to back and raise CS_N when done.
   // --------------------------------------------------------------------
   reg [11:0] pmem [0:15];
-  reg [11:0] shreg;
+  reg [10:0] shreg;  // holds the 11 bits shifted in so far; the 12th is MOSI
   reg [3:0]  bitcnt;
   reg [3:0]  ldaddr;
  
@@ -78,7 +78,7 @@ module tt_um_jet_seq16 (
  
   always @(posedge clk) begin
     if (!rst_n) begin
-      shreg  <= 12'd0;
+      shreg  <= 11'd0;
       bitcnt <= 4'd0;
       ldaddr <= 4'd0;
     end else if (csn_fall) begin
@@ -86,7 +86,7 @@ module tt_um_jet_seq16 (
       bitcnt <= 4'd0;
       ldaddr <= 4'd0;
     end else if (!csn && sck_rise) begin
-      shreg <= shreg_next;
+      shreg <= shreg_next[10:0];
       if (word_done) begin
         pmem[ldaddr] <= shreg_next;
         ldaddr       <= ldaddr + 4'd1;
@@ -171,6 +171,7 @@ module tt_um_jet_seq16 (
       end
     end else begin
       case (op)
+        OP_NOP:  pc <= pc + 4'd1;
         OP_OUTL: begin outl <= imm; pc <= pc + 4'd1; end
         OP_OUTH: begin outh <= imm; pc <= pc + 4'd1; end
         OP_WAIT: begin wait_cnt <= imm; waiting <= 1'b1; end
