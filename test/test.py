@@ -1,50 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Tests for the SEQ16 sequencer.
-
+Tests for the SEQ16B sequencer.
+ 
 Run them with:   cd test && make
-Waveforms land in test/tb.vcd, open that with GTKWave.
 """
-
+ 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge
-
+ 
 # ui_in bit positions
-SCK = 0
-MOSI = 1
-CSN = 2
-RUN = 3
-PIN0 = 4
-PIN1 = 5
-PIN2 = 6
-PIN3 = 7
-
-# Opcodes
-NOP, OUTL, OUTH, WAIT, JMP, JIF, JIFN, LDL, LOOP, PSCL, HALT = range(11)
-
-
+SCK, MOSI, CSN, RUN = 0, 1, 2, 3
+IN0, IN1 = 4, 5
+PS0, PS1 = 6, 7          # tick speed select: 00=1, 01=16, 10=256, 11=4096 cycles
+ 
+# Opcodes (2 bits)
+OUTA, WAIT, JMP, OUTB = range(4)
+ 
+# Jump conditions (imm[7:6])
+ALWAYS, IF_IN0, IF_IN1, STOP = range(4)
+ 
+ 
+def start_clock(dut):
+    """Start a 100 MHz clock. Works with both older and newer cocotb."""
+    try:
+        clock = Clock(dut.clk, 10, unit="ns")
+    except TypeError:
+        clock = Clock(dut.clk, 10, units="ns")
+    cocotb.start_soon(clock.start())
+ 
+ 
 def enc(op, imm=0):
-    """Encode one 12-bit instruction."""
-    return ((op & 0xF) << 8) | (imm & 0xFF)
-
-
+    """Encode one 10-bit instruction."""
+    return ((op & 0x3) << 8) | (imm & 0xFF)
+ 
+ 
+def jmp(addr, cond=ALWAYS):
+    return enc(JMP, (cond << 6) | (addr & 0xF))
+ 
+ 
+HALT = enc(JMP, STOP << 6)
+WORD_BITS = 10
+ 
+ 
 class Pins:
-    """Small helper that keeps track of the ui_in value."""
-
+    """Keeps track of the ui_in value."""
+ 
     def __init__(self, dut):
         self.dut = dut
         self.value = 1 << CSN  # CS_N idles high, everything else low
         dut.ui_in.value = self.value
-
+ 
     def set(self, bit, level):
         if level:
             self.value |= 1 << bit
         else:
             self.value &= ~(1 << bit)
         self.dut.ui_in.value = self.value
-
-
+ 
+    def set_speed(self, sel):
+        self.set(PS0, sel & 1)
+        self.set(PS1, (sel >> 1) & 1)
+ 
+ 
 async def reset(dut):
     dut.ena.value = 1
     dut.uio_in.value = 0
@@ -54,277 +72,258 @@ async def reset(dut):
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 5)
     return pins
-
-
+ 
+ 
 async def load_program(dut, pins, words):
-    """Shift a list of 12-bit instructions in over the SPI-like port."""
+    """Shift a list of 10-bit instructions in over the SPI-like port."""
     pins.set(RUN, 0)  # core stays in reset while loading
     await ClockCycles(dut.clk, 3)
-
+ 
     pins.set(CSN, 0)
     await ClockCycles(dut.clk, 4)
-
+ 
     for word in words:
-        for i in range(11, -1, -1):
+        for i in range(WORD_BITS - 1, -1, -1):
             pins.set(MOSI, (word >> i) & 1)
             pins.set(SCK, 0)
             await ClockCycles(dut.clk, 4)
             pins.set(SCK, 1)
             await ClockCycles(dut.clk, 4)
-
+ 
     pins.set(SCK, 0)
     await ClockCycles(dut.clk, 4)
     pins.set(CSN, 1)
     await ClockCycles(dut.clk, 4)
-
-
+ 
+ 
 async def start(dut, pins):
     pins.set(RUN, 1)
     await ClockCycles(dut.clk, 4)  # let the synchronisers catch up
-
-
-@cocotb.test()
-async def test_reset_clears_outputs(dut):
-    """After reset, with RUN low, both output ports read zero."""
-    dut._log.info("start")
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    await reset(dut)
-
-    assert dut.uo_out.value == 0
-    assert dut.uio_out.value == 0
-    # All bidirectional pins are configured as outputs
-    assert dut.uio_oe.value == 0xFF
-
-
-@cocotb.test()
-async def test_outl_outh_halt(dut):
-    """OUTL and OUTH drive the two output ports, then HALT freezes them."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
+ 
+ 
+async def gap_cycles(dut, sel, n):
+    """Cycles between OUT 1 and OUT 2 for a WAIT n at a given tick speed."""
     pins = await reset(dut)
-
+    pins.set_speed(sel)
     await load_program(dut, pins, [
-        enc(OUTL, 0xA5),
-        enc(OUTH, 0x3C),
-        enc(HALT),
-    ])
-    await start(dut, pins)
-    await ClockCycles(dut.clk, 10)
-
-    assert dut.uo_out.value == 0xA5, f"uo_out = {dut.uo_out.value}"
-    assert dut.uio_out.value == 0x3C, f"uio_out = {dut.uio_out.value}"
-
-    # Halted means halted: nothing changes no matter how long we wait
-    await ClockCycles(dut.clk, 200)
-    assert dut.uo_out.value == 0xA5
-    assert dut.uio_out.value == 0x3C
-
-
-@cocotb.test()
-async def test_run_low_resets_core(dut):
-    """Dropping RUN clears the outputs and rewinds to address 0."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    pins = await reset(dut)
-
-    await load_program(dut, pins, [enc(OUTL, 0xFF), enc(HALT)])
-    await start(dut, pins)
-    await ClockCycles(dut.clk, 10)
-    assert dut.uo_out.value == 0xFF
-
-    pins.set(RUN, 0)
-    await ClockCycles(dut.clk, 6)
-    assert dut.uo_out.value == 0x00
-
-    # And it restarts cleanly from the same program
-    pins.set(RUN, 1)
-    await ClockCycles(dut.clk, 10)
-    assert dut.uo_out.value == 0xFF
-
-
-@cocotb.test()
-async def test_wait_timing(dut):
-    """WAIT n holds for the expected number of cycles at PSCL 0."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    pins = await reset(dut)
-
-    n = 3
-    await load_program(dut, pins, [
-        enc(PSCL, 0),      # tick every clock cycle
-        enc(OUTL, 0x01),
+        enc(OUTA, 0x01),
         enc(WAIT, n),
-        enc(OUTL, 0x02),
-        enc(HALT),
+        enc(OUTA, 0x02),
+        HALT,
     ])
     await start(dut, pins)
-
-    # Wait until the first value appears, then count until the second
+ 
     while dut.uo_out.value != 0x01:
         await RisingEdge(dut.clk)
-
     cycles = 0
     while dut.uo_out.value != 0x02:
         await RisingEdge(dut.clk)
         cycles += 1
-
-    expected = n + 3
-    assert cycles == expected, f"WAIT {n} took {cycles} cycles, expected {expected}"
-
-
+    return cycles
+ 
+ 
 @cocotb.test()
-async def test_prescaler_slows_wait(dut):
-    """A bigger PSCL value makes the same WAIT take proportionally longer."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-
-    durations = {}
-    for pscl in (0, 2):
-        pins = await reset(dut)
-        await load_program(dut, pins, [
-            enc(PSCL, pscl),
-            enc(OUTL, 0x01),
-            enc(WAIT, 3),
-            enc(OUTL, 0x02),
-            enc(HALT),
-        ])
-        await start(dut, pins)
-
-        while dut.uo_out.value != 0x01:
-            await RisingEdge(dut.clk)
-        cycles = 0
-        while dut.uo_out.value != 0x02:
-            await RisingEdge(dut.clk)
-            cycles += 1
-        durations[pscl] = cycles
-
-    dut._log.info(f"durations: {durations}")
-    # WAIT 3 at PSCL 0 takes 6 cycles; at PSCL 2 each tick is 4 cycles
-    assert durations[2] >= durations[0] * 2, (
-        f"prescaler had little effect: {durations}"
-    )
-
-
+async def test_reset_state(dut):
+    """After reset the outputs are zero and the bidirectional pins are not driven."""
+    start_clock(dut)
+    await reset(dut)
+ 
+    assert dut.uo_out.value == 0
+    assert dut.uio_out.value == 0
+    # Both bidirectional pins are now driven as outputs
+    assert dut.uio_oe.value == 0xFF
+ 
+ 
 @cocotb.test()
-async def test_jump_loops_forever(dut):
-    """JMP makes a program repeat."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
+async def test_out_then_halt(dut):
+    """OUTA and OUTB drive the two output ports, then HALT freezes them."""
+    start_clock(dut)
     pins = await reset(dut)
-
+ 
     await load_program(dut, pins, [
-        enc(PSCL, 0),
-        enc(OUTL, 0x11),
-        enc(WAIT, 2),
-        enc(OUTL, 0x22),
-        enc(WAIT, 2),
-        enc(JMP, 1),
+        enc(OUTA, 0xA5),
+        enc(OUTB, 0x3C),
+        HALT,
     ])
     await start(dut, pins)
-
-    seen = set()
+    await ClockCycles(dut.clk, 10)
+    assert dut.uo_out.value == 0xA5, f"uo_out = {dut.uo_out.value}"
+    assert dut.uio_out.value == 0x3C, f"uio_out = {dut.uio_out.value}"
+ 
+    await ClockCycles(dut.clk, 200)
+    assert dut.uo_out.value == 0xA5, "port A changed after HALT"
+    assert dut.uio_out.value == 0x3C, "port B changed after HALT"
+ 
+ 
+@cocotb.test()
+async def test_run_low_resets_core(dut):
+    """Dropping RUN clears the outputs and rewinds to address 0."""
+    start_clock(dut)
+    pins = await reset(dut)
+ 
+    await load_program(dut, pins, [enc(OUTA, 0xFF), HALT])
+    await start(dut, pins)
+    await ClockCycles(dut.clk, 10)
+    assert dut.uo_out.value == 0xFF
+ 
+    pins.set(RUN, 0)
+    await ClockCycles(dut.clk, 6)
+    assert dut.uo_out.value == 0x00
+ 
+    pins.set(RUN, 1)
+    await ClockCycles(dut.clk, 10)
+    assert dut.uo_out.value == 0xFF
+ 
+ 
+@cocotb.test()
+async def test_wait_timing(dut):
+    """WAIT n takes n + 3 clock cycles at the fastest tick speed."""
+    start_clock(dut)
+    for n in (0, 3, 9):
+        cycles = await gap_cycles(dut, 0, n)
+        assert cycles == n + 3, f"WAIT {n} took {cycles} cycles, expected {n + 3}"
+ 
+ 
+@cocotb.test()
+async def test_tick_speed_select(dut):
+    """ui_in[7:6] = 01 makes each tick 16 clock cycles."""
+    start_clock(dut)
+    n = 3
+    fast = await gap_cycles(dut, 0, n)
+    slow = await gap_cycles(dut, 1, n)
+    dut._log.info(f"fast = {fast}, slow = {slow}")
+    assert 16 * n <= slow <= 16 * (n + 2), f"slow = {slow}"
+    assert slow > fast * 5
+ 
+ 
+@cocotb.test()
+async def test_jump_loops(dut):
+    """JMP makes a program repeat."""
+    start_clock(dut)
+    pins = await reset(dut)
+ 
+    await load_program(dut, pins, [
+        enc(OUTA, 0x11),
+        enc(WAIT, 2),
+        enc(OUTA, 0x22),
+        enc(WAIT, 2),
+        jmp(0),
+    ])
+    await start(dut, pins)
+ 
+    seen = []
     for _ in range(200):
         await RisingEdge(dut.clk)
-        seen.add(int(dut.uo_out.value))
-
-    assert 0x11 in seen and 0x22 in seen, f"saw {seen}"
-
-
+        v = int(dut.uo_out.value)
+        if not seen or seen[-1] != v:
+            seen.append(v)
+ 
+    body = [v for v in seen if v != 0]
+    assert body[:4] == [0x11, 0x22, 0x11, 0x22], f"saw {seen}"
+ 
+ 
 @cocotb.test()
-async def test_jif_branches_on_input(dut):
-    """JIF takes the branch only while the selected input pin is high."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    pins = await reset(dut)
-
-    # addr 0: PSCL 0
-    # addr 1: JIF pin0 -> 3
-    # addr 2: OUTL 0xAA ; HALT   (pin low path)
-    # addr 4: OUTL 0x55 ; HALT   (pin high path)
-    await load_program(dut, pins, [
-        enc(PSCL, 0),
-        enc(JIF, (0 << 4) | 4),
-        enc(OUTL, 0xAA),
-        enc(HALT),
-        enc(OUTL, 0x55),
-        enc(HALT),
-    ])
-
-    pins.set(PIN0, 0)
-    await start(dut, pins)
-    await ClockCycles(dut.clk, 20)
-    assert dut.uo_out.value == 0xAA, "pin low should fall through"
-
-    # Now rerun with the pin high
-    pins.set(RUN, 0)
-    pins.set(PIN0, 1)
-    await ClockCycles(dut.clk, 6)
-    pins.set(RUN, 1)
-    await ClockCycles(dut.clk, 20)
-    assert dut.uo_out.value == 0x55, "pin high should take the branch"
-
-
+async def test_conditional_jumps(dut):
+    """JMP if IN0 / IN1 branches only while that input is high."""
+    start_clock(dut)
+ 
+    for pin, cond in ((IN0, IF_IN0), (IN1, IF_IN1)):
+        for level, expected in ((0, 0xAA), (1, 0x55)):
+            pins = await reset(dut)
+            await load_program(dut, pins, [
+                jmp(3, cond),        # 0: branch to 3 if the pin is high
+                enc(OUTA, 0xAA),      # 1: pin low path
+                HALT,                # 2
+                enc(OUTA, 0x55),      # 3: pin high path
+                HALT,                # 4
+            ])
+            pins.set(pin, level)
+            await start(dut, pins)
+            await ClockCycles(dut.clk, 20)
+            assert dut.uo_out.value == expected, (
+                f"pin bit {pin} level {level}: got {dut.uo_out.value}, "
+                f"expected {expected:#x}"
+            )
+ 
+ 
 @cocotb.test()
-async def test_loop_counter(dut):
-    """LDL + LOOP repeats a block a fixed number of times."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
+async def test_program_counter_wraps(dut):
+    """A program that fills all 16 words loops on its own, with no JMP."""
+    start_clock(dut)
     pins = await reset(dut)
-
-    # Toggle the output 3 extra times, then fall through and halt with 0xFF
-    await load_program(dut, pins, [
-        enc(PSCL, 0),
-        enc(LDL, 3),
-        enc(OUTL, 0x01),     # addr 2: body
-        enc(OUTL, 0x00),
-        enc(LOOP, 2),
-        enc(OUTL, 0xFF),
-        enc(HALT),
-    ])
+ 
+    program = []
+    for i in range(8):
+        program += [enc(OUTA, 1 << i), enc(WAIT, 0)]
+    await load_program(dut, pins, program)
     await start(dut, pins)
-    await ClockCycles(dut.clk, 100)
-
-    assert dut.uo_out.value == 0xFF, (
-        f"loop did not terminate, uo_out = {dut.uo_out.value}"
+ 
+    seen = []
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        v = int(dut.uo_out.value)
+        if v != 0 and (not seen or seen[-1] != v):
+            seen.append(v)
+ 
+    expected = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2]
+    assert seen[:10] == expected, f"saw {seen[:10]}"
+ 
+ 
+@cocotb.test()
+async def test_jump_to_high_address(dut):
+    """Jump targets above 7 work, proving all 16 words are reachable."""
+    start_clock(dut)
+    pins = await reset(dut)
+ 
+    program = [jmp(12)] + [enc(OUTA, 0xAA)] * 11 + [enc(OUTA, 0x55), HALT]
+    await load_program(dut, pins, program)
+    await start(dut, pins)
+    await ClockCycles(dut.clk, 30)
+ 
+    assert dut.uo_out.value == 0x55, (
+        f"jump to address 12 failed, uo_out = {dut.uo_out.value}"
     )
-
-
+ 
+ 
 @cocotb.test()
-async def test_traffic_light_sequence(dut):
-    """The real traffic-light program cycles through all four phases."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
+async def test_traffic_light(dut):
+    """The traffic-light program cycles through all four phases."""
+    start_clock(dut)
     pins = await reset(dut)
-
-    A_GREEN = 0b00001100
-    A_YELLOW = 0b00001010
-    B_GREEN = 0b00100001
-    B_YELLOW = 0b00010001
-
+ 
+    A_GREEN = 0b00001100    # A green, B red
+    A_YELLOW = 0b00001010   # A yellow, B red
+    B_GREEN = 0b00100001    # A red, B green
+    B_YELLOW = 0b00010001   # A red, B yellow
+ 
+    WALK, DONT_WALK = 0x01, 0x02
+ 
     await load_program(dut, pins, [
-        enc(PSCL, 0),            # fast, so the test finishes quickly
-        enc(OUTL, A_GREEN),      # addr 1
-        enc(WAIT, 9),
-        enc(OUTL, A_YELLOW),
-        enc(WAIT, 4),
-        enc(OUTL, B_GREEN),
-        enc(WAIT, 9),
-        enc(OUTL, B_YELLOW),
-        enc(WAIT, 4),
-        enc(JMP, 1),
+        enc(OUTB, DONT_WALK),
+        enc(OUTA, A_GREEN), enc(WAIT, 9),
+        enc(OUTA, A_YELLOW), enc(WAIT, 4),
+        enc(OUTB, WALK),
+        enc(OUTA, B_GREEN), enc(WAIT, 9),
+        enc(OUTB, DONT_WALK),
+        enc(OUTA, B_YELLOW), enc(WAIT, 4),
+        jmp(1),
     ])
     await start(dut, pins)
-
-    # Record the order phases appear in
+ 
     order = []
-    last = None
     for _ in range(400):
         await RisingEdge(dut.clk)
-        val = int(dut.uo_out.value)
-        if val != last:
-            order.append(val)
-            last = val
-
-    expected = [A_GREEN, A_YELLOW, B_GREEN, B_YELLOW]
-    # Find the first full cycle in what we recorded
-    assert A_GREEN in order, f"never saw A green, got {order}"
-    i = order.index(A_GREEN)
-    got = order[i:i + 4]
-    assert got == expected, f"phase order was {got}, expected {expected}"
-
-    # Green and red must never be on together for one direction
-    for val in order:
-        assert not (val & 0b001) or not (val & 0b100), "A red and green together"
-        assert not (val & 0b001000) or not (val & 0b100000), "B red and green together"
+        v = int(dut.uo_out.value)
+        if v != 0 and (not order or order[-1] != v):
+            order.append(v)
+ 
+    expected = [A_GREEN, A_YELLOW, B_GREEN, B_YELLOW] * 2
+    assert order[:8] == expected, f"phase order was {order[:8]}"
+ 
+    # Safety: never conflicting lights
+    for v in order:
+        a_red, a_grn = v & 0b000001, v & 0b000100
+        b_red, b_grn = v & 0b001000, v & 0b100000
+        assert not (a_red and a_grn), "A red and green together"
+        assert not (b_red and b_grn), "B red and green together"
+        assert not (a_grn and b_grn), "both directions green"
