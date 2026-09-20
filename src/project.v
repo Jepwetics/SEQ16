@@ -12,9 +12,9 @@
  
 module tt_um_jet_seq16 (
     input  wire [7:0] ui_in,    // dedicated inputs
-    output wire [7:0] uo_out,   // dedicated outputs
+    output wire [7:0] uo_out,   // dedicated outputs (port A)
     input  wire [7:0] uio_in,   // bidirectional: input path (unused)
-    output wire [7:0] uio_out,  // bidirectional: output path
+    output wire [7:0] uio_out,  // bidirectional: output path (port B)
     output wire [7:0] uio_oe,   // bidirectional: 1 = drive as output
     input  wire       ena,      // always 1 when the design is selected
     input  wire       clk,      // clock
@@ -24,8 +24,7 @@ module tt_um_jet_seq16 (
   // --------------------------------------------------------------------
   // Input synchronisers.
   // ui_in comes from the outside world and can change at any moment, so
-  // we pass every input through two flip-flops before using it. This
-  // avoids metastability. Standard practice, cheap, worth it.
+  // every input passes through two flip-flops before it is used.
   // --------------------------------------------------------------------
   reg [7:0] sync0, sync1;
  
@@ -39,11 +38,13 @@ module tt_um_jet_seq16 (
     end
   end
  
-  wire       sck  = sync1[0];  // program clock
-  wire       mosi = sync1[1];  // program data
-  wire       csn  = sync1[2];  // program chip-select, active low
-  wire       run  = sync1[3];  // 1 = execute, 0 = reset the core
-  wire [3:0] pins = sync1[7:4];  // 4 general inputs the program can test
+  wire       sck    = sync1[0];    // program load clock
+  wire       mosi   = sync1[1];    // program load data
+  wire       csn    = sync1[2];    // program load select, active low
+  wire       run    = sync1[3];    // 1 = execute, 0 = reset the core
+  wire       in0    = sync1[4];    // branch input 0
+  wire       in1    = sync1[5];    // branch input 1
+  wire [1:0] ps_sel = sync1[7:6];  // tick speed select
  
   // Edge detectors for the loader
   reg sck_d, csn_d;
@@ -63,22 +64,22 @@ module tt_um_jet_seq16 (
   // --------------------------------------------------------------------
   // Program memory and the loader.
   //
-  // 16 words x 12 bits. Pull CS_N low, then clock 12 bits per
+  // 16 words x 10 bits. Pull CS_N low, then clock 10 bits per
   // instruction on the rising edge of SCK, most significant bit first.
-  // The write address starts at 0 and auto-increments, so you just shift
-  // in your whole program back to back and raise CS_N when done.
+  // The write address starts at 0 and auto-increments, so you shift in
+  // the whole program back to back and raise CS_N when done.
   // --------------------------------------------------------------------
-  reg [11:0] pmem [0:15];
-  reg [10:0] shreg;  // holds the 11 bits shifted in so far; the 12th is MOSI
-  reg [3:0]  bitcnt;
-  reg [3:0]  ldaddr;
+  reg [9:0] pmem [0:15];
+  reg [8:0] shreg;    // the 9 bits shifted in so far; the 10th is MOSI
+  reg [3:0] bitcnt;
+  reg [3:0] ldaddr;
  
-  wire [11:0] shreg_next = {shreg[10:0], mosi};
-  wire        word_done  = (bitcnt == 4'd11);
+  wire [9:0] shreg_next = {shreg, mosi};
+  wire       word_done  = (bitcnt == 4'd9);
  
   always @(posedge clk) begin
     if (!rst_n) begin
-      shreg  <= 11'd0;
+      shreg  <= 9'd0;
       bitcnt <= 4'd0;
       ldaddr <= 4'd0;
     end else if (csn_fall) begin
@@ -86,7 +87,7 @@ module tt_um_jet_seq16 (
       bitcnt <= 4'd0;
       ldaddr <= 4'd0;
     end else if (!csn && sck_rise) begin
-      shreg <= shreg_next[10:0];
+      shreg <= shreg_next[8:0];
       if (word_done) begin
         pmem[ldaddr] <= shreg_next;
         ldaddr       <= ldaddr + 4'd1;
@@ -98,68 +99,79 @@ module tt_um_jet_seq16 (
   end
  
   // --------------------------------------------------------------------
-  // Prescaler.
+  // Tick generator.
   //
-  // Generates a slow "tick" used by the WAIT instruction. PSCL n makes
-  // one tick every 2^n clock cycles, so WAIT can span anything from one
-  // clock up to about 8 million.
+  // WAIT counts "ticks". ui_in[7:6] picks how many clock cycles make one
+  // tick: 00 = 1, 01 = 16, 10 = 256, 11 = 4096. The counter is held at
+  // zero while RUN is low so timing always starts from the same point.
   // --------------------------------------------------------------------
-  reg  [15:0] ps_cnt;
-  reg  [3:0]  ps_sel;
+  reg [11:0] ps_cnt;
  
-  wire [15:0] ps_mask = (16'd1 << ps_sel) - 16'd1;
-  wire        tick    = (ps_cnt == ps_mask);
+  wire t0 = &ps_cnt[3:0];
+  wire t1 = &ps_cnt[7:4];
+  wire t2 = &ps_cnt[11:8];
+ 
+  wire tick = (ps_sel == 2'd0)
+            | ((ps_sel == 2'd1) & t0)
+            | ((ps_sel == 2'd2) & t0 & t1)
+            | ((ps_sel == 2'd3) & t0 & t1 & t2);
  
   always @(posedge clk) begin
-    if (!rst_n) ps_cnt <= 16'd0;
-    else        ps_cnt <= tick ? 16'd0 : (ps_cnt + 16'd1);
+    if (!rst_n || !run) ps_cnt <= 12'd0;
+    else                ps_cnt <= ps_cnt + 12'd1;
   end
  
   // --------------------------------------------------------------------
   // The core.
+  //
+  // Instruction word: [9:8] opcode, [7:0] operand.
+  //   00 OUTA imm         uo_out  <= imm
+  //   01 WAIT n           pause for n+1 ticks
+  //   10 JMP  cond,addr   cond = imm[7:6], addr = imm[3:0]
+  //                         00 always, 01 if IN0 high, 10 if IN1 high,
+  //                         11 HALT (stop, outputs hold)
+  //   11 OUTB imm         uio_out <= imm
+  // The program counter is 4 bits, so it wraps from 15 back to 0 by
+  // itself. A program that fills all 16 words loops without a JMP.
   // --------------------------------------------------------------------
-  reg [3:0] pc;        // program counter
-  reg [7:0] wait_cnt;  // ticks remaining in a WAIT
-  reg [7:0] loop_cnt;  // loop counter for LDL / LOOP
-  reg [7:0] outl;      // value on uo_out
-  reg [7:0] outh;      // value on uio_out
+  localparam OP_OUTA = 2'd0;
+  localparam OP_WAIT = 2'd1;
+  localparam OP_JMP  = 2'd2;
+  localparam OP_OUTB = 2'd3;
+ 
+  localparam C_ALWAYS = 2'd0;
+  localparam C_IN0    = 2'd1;
+  localparam C_IN1    = 2'd2;
+  localparam C_HALT   = 2'd3;
+ 
+  reg [3:0] pc;
+  reg [7:0] wait_cnt;
+  reg [7:0] outa;
+  reg [7:0] outb;
   reg       waiting;
   reg       halted;
  
-  wire [11:0] ir  = pmem[pc];
-  wire [3:0]  op  = ir[11:8];
-  wire [7:0]  imm = ir[7:0];
+  wire [9:0] ir   = pmem[pc];
+  wire [1:0] op   = ir[9:8];
+  wire [7:0] imm  = ir[7:0];
+  wire [1:0] cond = imm[7:6];
  
-  // Opcode names
-  localparam OP_NOP  = 4'h0;
-  localparam OP_OUTL = 4'h1;
-  localparam OP_OUTH = 4'h2;
-  localparam OP_WAIT = 4'h3;
-  localparam OP_JMP  = 4'h4;
-  localparam OP_JIF  = 4'h5;
-  localparam OP_JIFN = 4'h6;
-  localparam OP_LDL  = 4'h7;
-  localparam OP_LOOP = 4'h8;
-  localparam OP_PSCL = 4'h9;
-  localparam OP_HALT = 4'hA;
- 
-  wire sel_pin = pins[imm[5:4]];
+  wire take = (cond == C_ALWAYS)
+            | ((cond == C_IN0) & in0)
+            | ((cond == C_IN1) & in1);
  
   always @(posedge clk) begin
     if (!rst_n || !run) begin
       // RUN low holds the core in reset. Load your program while RUN is
-      // low, then raise it to start execution from address 0.
+      // low, then raise it to start from address 0.
       pc       <= 4'd0;
       wait_cnt <= 8'd0;
-      loop_cnt <= 8'd0;
-      outl     <= 8'd0;
-      outh     <= 8'd0;
-      ps_sel   <= 4'd0;
+      outa     <= 8'd0;
+      outb     <= 8'd0;
       waiting  <= 1'b0;
       halted   <= 1'b0;
     end else if (halted) begin
-      // stay put, outputs hold their last value
-      halted <= 1'b1;
+      halted <= 1'b1;  // stay put, outputs hold their last value
     end else if (waiting) begin
       if (tick) begin
         if (wait_cnt == 8'd0) begin
@@ -171,25 +183,14 @@ module tt_um_jet_seq16 (
       end
     end else begin
       case (op)
-        OP_NOP:  pc <= pc + 4'd1;
-        OP_OUTL: begin outl <= imm; pc <= pc + 4'd1; end
-        OP_OUTH: begin outh <= imm; pc <= pc + 4'd1; end
+        OP_OUTA: begin outa <= imm; pc <= pc + 4'd1; end
+        OP_OUTB: begin outb <= imm; pc <= pc + 4'd1; end
         OP_WAIT: begin wait_cnt <= imm; waiting <= 1'b1; end
-        OP_JMP:  pc <= imm[3:0];
-        OP_JIF:  pc <= sel_pin ? imm[3:0] : (pc + 4'd1);
-        OP_JIFN: pc <= sel_pin ? (pc + 4'd1) : imm[3:0];
-        OP_LDL:  begin loop_cnt <= imm; pc <= pc + 4'd1; end
-        OP_LOOP: begin
-          if (loop_cnt != 8'd0) begin
-            loop_cnt <= loop_cnt - 8'd1;
-            pc       <= imm[3:0];
-          end else begin
-            pc <= pc + 4'd1;
-          end
+        OP_JMP: begin
+          if (cond == C_HALT) halted <= 1'b1;
+          else if (take)      pc <= imm[3:0];
+          else                pc <= pc + 4'd1;
         end
-        OP_PSCL: begin ps_sel <= imm[3:0]; pc <= pc + 4'd1; end
-        OP_HALT: halted <= 1'b1;
-        default: pc <= pc + 4'd1;  // NOP and anything undefined
       endcase
     end
   end
@@ -197,9 +198,9 @@ module tt_um_jet_seq16 (
   // --------------------------------------------------------------------
   // Outputs
   // --------------------------------------------------------------------
-  assign uo_out  = outl;
-  assign uio_out = outh;
-  assign uio_oe  = 8'hFF;  // all 8 bidirectional pins used as outputs
+  assign uo_out  = outa;
+  assign uio_out = outb;
+  assign uio_oe  = 8'hFF;  // all 8 bidirectional pins driven as outputs
  
   // Tie off unused inputs so the linter stays quiet
   wire _unused = &{ena, uio_in, 1'b0};
