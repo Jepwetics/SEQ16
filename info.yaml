@@ -1,23 +1,23 @@
 # Tiny Tapeout project information
 project:
-  title:        "SEQ16 Programmable Sequencer"
+  title:        "SEQ16B Programmable Sequencer"
   author:       "JET"
   discord:      ""
   description:  "16-instruction programmable sequencer driving 16 output pins"
   language:     "Verilog"
   clock_hz:     10000000
-
+ 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1"
-
+ 
   # Your top module name must start with "tt_um_".
   top_module:  "tt_um_jet_seq16"
-
+ 
   # List your source files here. Source files must be in ./src and you
   # must list each one separately, one per line.
   source_files:
     - "project.v"
-
+ 
 # The pinout of your project. Leave unused pins blank.
 pinout:
   # Inputs
@@ -27,28 +27,29 @@ pinout:
   ui[3]: "RUN - high to execute, low to reset the core"
   ui[4]: "IN0 - branch input 0"
   ui[5]: "IN1 - branch input 1"
-  ui[6]: "IN2 - branch input 2"
-  ui[7]: "IN3 - branch input 3"
-
+  ui[6]: "TICK0 - tick speed select, low bit"
+  ui[7]: "TICK1 - tick speed select, high bit"
+ 
   # Outputs
-  uo[0]: "OUTL0"
-  uo[1]: "OUTL1"
-  uo[2]: "OUTL2"
-  uo[3]: "OUTL3"
-  uo[4]: "OUTL4"
-  uo[5]: "OUTL5"
-  uo[6]: "OUTL6"
-  uo[7]: "OUTL7"
-
-  # Bidirectional pins (all driven as outputs)
-  uio[0]: "OUTH0"
-  uio[1]: "OUTH1"
-  uio[2]: "OUTH2"
-  uio[3]: "OUTH3"
-  uio[4]: "OUTH4"
-  uio[5]: "OUTH5"
-  uio[6]: "OUTH6"
-  uio[7]: "OUTH7"
-
+  uo[0]: "A0 - port A bit 0"
+  uo[1]: "A1 - port A bit 1"
+  uo[2]: "A2 - port A bit 2"
+  uo[3]: "A3 - port A bit 3"
+  uo[4]: "A4 - port A bit 4"
+  uo[5]: "A5 - port A bit 5"
+  uo[6]: "A6 - port A bit 6"
+  uo[7]: "A7 - port A bit 7"
+ 
+  # Bidirectional pins (all driven as outputs, port B)
+  uio[0]: "B0 - port B bit 0"
+  uio[1]: "B1 - port B bit 1"
+  uio[2]: "B2 - port B bit 2"
+  uio[3]: "B3 - port B bit 3"
+  uio[4]: "B4 - port B bit 4"
+  uio[5]: "B5 - port B bit 5"
+  uio[6]: "B6 - port B bit 6"
+  uio[7]: "B7 - port B bit 7"
+ 
 # Do not change!
 yaml_version: 6
+ 
